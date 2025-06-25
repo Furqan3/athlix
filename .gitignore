@@ -1,0 +1,15 @@
+/frontend/.next
+/frontend/node_modules
+/frontend/package-lock.json
+/frontend/.qodo
+.vscode
+env
+uploaded_images
+medical*
+# Ignore all files in the uploaded_images directory
+# except for the .gitkeep file
+uploaded_images/*
+!uploaded_images/.gitkeep
+__pycache__
+*.pyc
+.env
