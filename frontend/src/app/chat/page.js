@@ -857,10 +857,8 @@ const ChatPage = () => {
             ) : (
               <div className="flex-1 flex items-center justify-center p-12">
                 <div className="text-center max-w-md">
-                  <div className="w-24 h-24 bg-gradient-to-br from-indigo-100 to-purple-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                    <Bot className="w-12 h-12 text-indigo-600" />
-                  </div>
-                  <h3 className="text-xl font-bold text-gray-900 mb-2">Welcome to Medical AI</h3>
+                  <image src="/logo.png" alt="Medical AI Logo" className="h-16 mb-4 mx-auto" />
+                  <h3 className="text-xl font-bold text-gray-900 mb-2">Welcome to Athlix</h3>
                   <p className="text-gray-600 mb-8 leading-relaxed">
                     Get personalized health insights and recommendations. Start a conversation or upload a medical image for analysis.
                   </p>
