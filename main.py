@@ -191,6 +191,9 @@ def get_db():
 
 app = FastAPI(title="Complete Medical & Authentication API", version="3.0.0")
 
+# Mount static files directory for uploaded images
+app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
+
 # CORS middleware must be added to the main app before any routes
 app.add_middleware(
     CORSMiddleware,
