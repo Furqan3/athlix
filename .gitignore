@@ -13,3 +13,5 @@ uploaded_images/*
 __pycache__
 *.pyc
 .env
+/frontend/out/
+/myenv/

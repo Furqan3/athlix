@@ -19,7 +19,7 @@ import {
 import { jsPDF } from 'jspdf';
 
 // API Configuration
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = "https://app.athlix.fit";
 
 // Utility Functions
 const apiRequest = async (endpoint, options = {}) => {
@@ -68,7 +68,7 @@ const apiRequest = async (endpoint, options = {}) => {
     console.error('API request error:', error);
 
     if (error.name === "TypeError" && error.message.includes("fetch")) {
-      throw new Error("Unable to connect to server. Please check if the backend is running on http://localhost:8000");
+              throw new Error("Unable to connect to server. Please check if the backend is running.");
     }
 
     // Always return a string error message
@@ -183,9 +183,9 @@ const ChatMessage = ({ message, isUser, timestamp, imageUrl }) => {
           {/* Image if present */}
           {imageUrl && (
             <div className="mb-3">
-              <image 
+              <img 
                 src={imageUrl} 
-                alt="Medical image" 
+                alt="Image" 
                 className="max-w-sm rounded-lg shadow-md border border-gray-200"
                 style={{ maxHeight: '300px', objectFit: 'contain' }}
               />
@@ -271,7 +271,7 @@ const ImageUpload = ({ onImageUpload, loading }) => {
 
         <div className="space-y-2">
           <p className="text-lg font-medium text-gray-700">
-            Drop your medical image here
+            Drop your  image here
           </p>
           <p className="text-gray-500">
             or{" "}
@@ -302,7 +302,7 @@ const ImageUpload = ({ onImageUpload, loading }) => {
       {preview && !loading && (
         <div className="bg-gray-50 rounded-xl p-4">
           <p className="text-sm font-medium text-gray-700 mb-3">Preview:</p>
-          <image 
+          <img 
             src={preview} 
             alt="Upload preview" 
             className="max-w-full h-48 object-contain mx-auto rounded-lg shadow-sm border border-gray-200"
@@ -326,6 +326,8 @@ const ChatPage = () => {
   const [showImageUpload, setShowImageUpload] = useState(false);
   const [imageUploadLoading, setImageUploadLoading] = useState(false);
   const [showSidebar, setShowSidebar] = useState(false);
+  const [deletingSessionId, setDeletingSessionId] = useState(null);
+  const [deletingAllSessions, setDeletingAllSessions] = useState(false);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -361,7 +363,7 @@ const ChatPage = () => {
       console.error("Error fetching sessions:", err);
       if (err.message.includes("Unable to connect to server")) {
         setError(
-          "Cannot connect to the backend server. Please ensure the FastAPI server is running on http://localhost:8000"
+          "Cannot connect to the backend server. Please ensure the FastAPI server is running."
         );
       } else {
         setError("Failed to fetch chat sessions: " + err.message);
@@ -472,8 +474,9 @@ const ChatPage = () => {
 
   const deleteSession = async (sessionId, event) => {
     event.stopPropagation();
+    setDeletingSessionId(sessionId);
     try {
-      await apiRequest(`/chat/session/${sessionId}`, { methodCollector: "DELETE" });
+      await apiRequest(`/chat/session/${sessionId}`, { method: "DELETE" });
       setSessions((prev) => prev.filter((session) => session.session_id !== sessionId));
 
       if (selectedSession === sessionId) {
@@ -482,27 +485,28 @@ const ChatPage = () => {
         setError("");
       }
     } catch (err) {
-      console.error("Error deleting session:", err);
       setError("Failed to delete session");
+    } finally {
+      setDeletingSessionId(null);
     }
   };
 
   const deleteAllSessions = async () => {
+    setDeletingAllSessions(true);
     try {
       await apiRequest("/chat/sessions/all", { method: "DELETE" });
       setSessions([]);
-      setişti: setSelectedSession(null);
+      setSelectedSession(null);
       setMessages([]);
       setError("");
     } catch (err) {
-      console.error("Error deleting all sessions:", err);
       setError("Failed to delete all sessions");
+    } finally {
+      setDeletingAllSessions(false);
     }
   };
 
   const handleImageUpload = async (file) => {
-    console.log("Starting image upload process...");
-
     // Validate file size (10MB limit)
     if (file.size > 10 * 1024 * 1024) {
       setError("File size must be less than 10MB");
@@ -521,7 +525,7 @@ const ChatPage = () => {
     try {
       // Create a user message first
       const userMessage = {
-        content: "I've uploaded a medical image for analysis.",
+        content: "I've uploaded an image for analysis.",
         isUser: true,
         timestamp: new Date().toISOString(),
       };
@@ -529,7 +533,7 @@ const ChatPage = () => {
 
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("message", "Please analyze this medical image and provide insights.");
+      formData.append("message", "Please analyze this image and provide insights.");
       
       if (selectedSession) {
         formData.append("session_id", selectedSession);
@@ -556,7 +560,6 @@ const ChatPage = () => {
         fetchSessions();
       }
     } catch (err) {
-      console.error("Error uploading image:", err);
       const errorMessage = {
         content: `Failed to upload image: ${err.message}`,
         isUser: false,
@@ -597,7 +600,7 @@ const ChatPage = () => {
 
     doc.setFontSize(16);
     doc.setFont("helvetica", "bold");
-    doc.text(`Medical AI Chat - ${new Date().toLocaleDateString()}`, margin, y);
+    doc.text(`AI Chat - ${new Date().toLocaleDateString()}`, margin, y);
     y += 10;
 
     for (const msg of messages) {
@@ -641,7 +644,7 @@ const ChatPage = () => {
     }
 
     // Save the PDF
-    doc.save(`Medical_AI_Chat_${selectedSession || "new"}.pdf`);
+    doc.save(`AI_Chat_${selectedSession || "new"}.pdf`);
   };
 
   return (
@@ -660,7 +663,7 @@ const ChatPage = () => {
               <div className="flex items-center space-x-3">
                 
                 <div>
-                  <image src="/logo.png" alt="Medical AI Logo" className="h-9 " />
+                  <img src="/logo.png" alt="AI Logo" className="h-9 " />
                   <p className="text-sm text-gray-600">
                     Welcome, {userInfo?.first_name ? `${userInfo.first_name}` : "User"}
                   </p>
@@ -723,6 +726,10 @@ const ChatPage = () => {
                 <Download className="w-4 h-4" />
                 <span className="ml-2">Download Chat</span>
               </Button>
+              <Button onClick={deleteAllSessions} className="w-full flex items-center justify-center shadow-sm" variant="danger" disabled={deletingAllSessions || sessions.length === 0}>
+                {deletingAllSessions ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                <span className="ml-2">{deletingAllSessions ? "Deleting..." : "Delete All"}</span>
+              </Button>
 
                           </div>
 
@@ -764,9 +771,10 @@ const ChatPage = () => {
                           </div>
                           <button
                             onClick={(e) => deleteSession(session.session_id, e)}
+                            disabled={deletingSessionId === session.session_id}
                             className="p-2 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all duration-200 rounded-lg hover:bg-red-50"
                           >
-                            <Trash2 className="w-4 h-4" />
+                            {deletingSessionId === session.session_id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
                           </button>
                         </div>
                       </li>
@@ -857,10 +865,10 @@ const ChatPage = () => {
             ) : (
               <div className="flex-1 flex items-center justify-center p-12">
                 <div className="text-center max-w-md">
-                  <image src="/logo.png" alt="Medical AI Logo" className="h-16 mb-4 mx-auto" />
+                  <img src="/logo.png" alt="AI Logo" className="h-16 mb-4 mx-auto" />
                   <h3 className="text-xl font-bold text-gray-900 mb-2">Welcome to Athlix</h3>
                   <p className="text-gray-600 mb-8 leading-relaxed">
-                    Get personalized health insights and recommendations. Start a conversation or upload a medical image for analysis.
+                    Get personalized health insights and recommendations. Start a conversation or upload an image for analysis.
                   </p>
                   <div className="space-y-3">
                     <Button onClick={createNewSession} className="w-full flex items-center justify-center shadow-lg">
@@ -869,7 +877,7 @@ const ChatPage = () => {
                     </Button>
                     <Button onClick={() => setShowImageUpload(true)} className="w-full flex items-center justify-center shadow-lg" variant="secondary">
                       <Camera className="w-5 h-5" />
-                      <span className="ml-2">Analyze Medical Image</span>
+                      <span className="ml-2">Analyze Image</span>
                     </Button>
                   </div>
                 </div>
@@ -888,7 +896,7 @@ const ChatPage = () => {
             <div className="p-6">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="text-xl font-bold text-gray-900">Upload Medical Image</h3>
+                  <h3 className="text-xl font-bold text-gray-900">Upload Image</h3>
                   <p className="text-gray-600 text-sm mt-1">Get AI-powered analysis and recommendations</p>
                 </div>
                 <button

@@ -99,7 +99,7 @@ function VerifyEmailInner() {
     setResendMessage('')
 
     try {
-      const response = await fetch('http://localhost:8000/verify-email', {
+      const response = await fetch('/verify-email', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -113,7 +113,6 @@ function VerifyEmailInner() {
       const data = await response.json()
 
       if (response.ok) {
-        console.log('Email verification successful:', data)
         setSuccess(true)
         // Redirect to signin page after successful verification
         setTimeout(() => {
@@ -162,7 +161,6 @@ function VerifyEmailInner() {
         }
       }
     } catch (error) {
-      console.error('Verification error:', error)
       if (error.name === 'TypeError' && error.message.includes('fetch')) {
         setErrors({ general: 'Unable to connect to the server. Please check if the backend is running.' })
       } else {
@@ -191,7 +189,7 @@ function VerifyEmailInner() {
 
     try {
       const email = encodeURIComponent(formData.email.toLowerCase());
-const response = await fetch(`http://localhost:8000/resend-verification?email=${email}`, {
+      const response = await fetch(`/resend-verification?email=${email}`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
 });
@@ -232,7 +230,6 @@ const response = await fetch(`http://localhost:8000/resend-verification?email=${
         }
       }
     } catch (error) {
-      console.error('Resend error:', error)
       if (error.name === 'TypeError' && error.message.includes('fetch')) {
         setErrors({ general: 'Unable to connect to the server. Please check if the backend is running.' })
       } else {

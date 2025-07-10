@@ -121,7 +121,7 @@ export default function ForgotPassword() {
     setErrors({})
 
     try {
-      const response = await fetch('http://localhost:8000/forgot-password', {
+      const response = await fetch('/forgot-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -188,7 +188,7 @@ export default function ForgotPassword() {
     setErrors({})
 
     try {
-      const response = await fetch('http://localhost:8000/forgot-password', {
+      const response = await fetch('/forgot-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -227,7 +227,7 @@ export default function ForgotPassword() {
     setErrors({})
 
     try {
-      const response = await fetch('http://localhost:8000/reset-password', {
+      const response = await fetch('/reset-password', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -336,7 +336,7 @@ export default function ForgotPassword() {
       <div className="w-full max-w-md border border-black/20 rounded-2xl shadow-lg p-4">
         <div className="text-center mb-8">
           <div className="mx-auto flex items-center justify-center mb-4">
-            <image src="/logo.png" alt="Logo" />
+            <img src="/logo.png" alt="Logo" width="100" height="100" />
           </div>
           <h2 className="text-3xl font-bold text-gray-900 mb-2">
             {step === 1 ? 'Forgot Password?' : 'Reset Your Password'}

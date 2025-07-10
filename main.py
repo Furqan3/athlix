@@ -1,30 +1,31 @@
-from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Depends, UploadFile, File, Form, Request
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+from fastapi.responses import StreamingResponse
+import io
+import csv
+from sqlalchemy.orm import joinedload
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, validator
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 import hashlib
 import secrets
-import smtplib
 import os
 import jwt
+import requests
 import json
 import uuid
-import io
-import ssl
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
 from threading import Thread
 from openai import OpenAI
 from dotenv import load_dotenv
 from PIL import Image
 import base64
+import pandas as pd
 
 # Database imports
-from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Text, Integer, ForeignKey, Date
+from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Text, Integer, ForeignKey, Date, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -56,6 +57,10 @@ IMAGE_DIR = os.path.join(os.getcwd(), "uploaded_images")
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
 
+def utc_now():
+    """Returns current UTC datetime with timezone info."""
+    return datetime.now(timezone.utc)
+
 # Database Models (Updated Schema)
 class User(Base):
     """SQLAlchemy model for user accounts."""
@@ -73,9 +78,53 @@ class User(Base):
     verified_at = Column(DateTime, nullable=True)
     password_updated_at = Column(DateTime, nullable=True)
     
-    # Relationships
+    medical_sessions = relationship("MedicalSession", back_populates="user", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
+
+class MedicalSession(Base):
+    """SQLAlchemy model for medical assessment sessions."""
+    __tablename__ = "medical_sessions"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    image_path = Column(String, nullable=False)
+    status = Column(String, default="questioning")
+    current_question_index = Column(Integer, default=0)
+    treatment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = relationship("User", back_populates="medical_sessions")
+    questions = relationship("MedicalQuestion", back_populates="session", cascade="all, delete-orphan")
+    qa_history = relationship("MedicalQA", back_populates="session", cascade="all, delete-orphan")
+
+class MedicalQuestion(Base):
+    """SQLAlchemy model for questions within a medical assessment session."""
+    __tablename__ = "medical_questions"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("medical_sessions.id"), nullable=False)
+    question_text = Column(Text, nullable=False)
+    question_type = Column(String, nullable=False)
+    options = Column(Text, nullable=True)
+    order_index = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    session = relationship("MedicalSession", back_populates="questions")
+
+class MedicalQA(Base):
+    """SQLAlchemy model for question-answer history within a medical assessment session."""
+    __tablename__ = "medical_qa_history"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("medical_sessions.id"), nullable=False)
+    question_id = Column(String, nullable=False)
+    question_text = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    session = relationship("MedicalSession", back_populates="qa_history")
 
 class PendingVerification(Base):
     """SQLAlchemy model for pending email verifications."""
@@ -84,9 +133,10 @@ class PendingVerification(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, unique=True, index=True, nullable=False)
     verification_code = Column(String, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # This will be timezone-aware when created
     user_data = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow) 
+
 
 class PasswordResetToken(Base):
     """SQLAlchemy model for password reset tokens."""
@@ -95,32 +145,32 @@ class PasswordResetToken(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, index=True, nullable=False)
     reset_code = Column(String, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)  # This will be timezone-aware when created
+    created_at = Column(DateTime, default=datetime.utcnow) 
 
 class ChatSession(Base):
     """SQLAlchemy model for chat sessions."""
     __tablename__ = "chat_sessions"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_activity = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Relationships
+    # Relationships with explicit cascade
     user = relationship("User", back_populates="chat_sessions")
-    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan", passive_deletes=True)
 
 class ChatMessage(Base):
     """SQLAlchemy model for individual chat messages."""
     __tablename__ = "chat_messages"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
-    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    session_id = Column(String, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     content = Column(Text, nullable=False)
-    is_user = Column(Boolean, nullable=False)  # True if from user, False if from AI
-    image_path = Column(String, nullable=True)  # Path to uploaded image if any
+    is_user = Column(Boolean, nullable=False)
+    image_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -141,10 +191,7 @@ def get_db():
 
 app = FastAPI(title="Complete Medical & Authentication API", version="3.0.0")
 
-# Mount static files directory for uploaded images
-app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
-
-# CORS middleware
+# CORS middleware must be added to the main app before any routes
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -155,17 +202,17 @@ app.add_middleware(
 
 # JWT Configuration
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable not set. Please set it for security.")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
 # Security scheme for JWT authentication
 security = HTTPBearer()
 
-# Email configuration
-SMTP_SERVER = " mail.privateemail.com"
-SMTP_PORT = 587
-SMTP_USERNAME = os.getenv("EMAIL_ADDRESS")
-SMTP_PASSWORD = os.getenv("EMAIL_PASSWORD")
+# Email configuration with SendGrid
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+FROM_EMAIL = os.getenv("EMAIL_ADDRESS", "noreply@athlix.fit")
 
 # OpenAI client initialization
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -282,6 +329,23 @@ class ChatResponseModel(BaseModel):
     message_id: str
     timestamp: datetime
 
+class QuestionResponse(BaseModel):
+    session_id: str
+    question_id: str
+    answer: str
+
+class SessionStatus(BaseModel):
+    session_id: str
+    status: str
+    questions: List[Dict] = []
+    current_question_index: int = 0
+    treatment: Optional[str] = None
+
+class TreatmentResponse(BaseModel):
+    session_id: str
+    treatment: str
+    session_complete: bool
+
 class CreateChatSessionRequest(BaseModel):
     """Request model for creating a new chat session."""
     title: Optional[str] = None
@@ -303,19 +367,52 @@ def verify_password(password: str, hashed_password: str) -> bool:
 
 def create_jwt_token(user_data: dict) -> str:
     """Creates a JWT token for the given user data."""
-    payload = {
-        "user_id": user_data["id"],
-        "email": user_data["email"],
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.utcnow()
-    }
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    try:
+        payload = {
+            "user_id": user_data["id"],
+            "email": user_data["email"],
+            "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
+            "iat": datetime.now(timezone.utc)
+        }
+        
+        # Try different approaches based on your JWT library
+        try:
+            # For PyJWT version 2.x+
+            return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+        except AttributeError:
+            # For older PyJWT versions
+            import PyJWT
+            return PyJWT.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+        except:
+            # Fallback using python-jose
+            from jose import jwt as jose_jwt
+            return jose_jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+            
+    except Exception as e:
+        print(f"JWT encoding error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error creating authentication token"
+        )
 
 def verify_jwt_token(token: str) -> dict:
     """Verifies and decodes a JWT token."""
     try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        # Try different approaches based on your JWT library
+        try:
+            # For PyJWT version 2.x+
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        except AttributeError:
+            # For older PyJWT versions
+            import PyJWT
+            payload = PyJWT.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        except:
+            # Fallback using python-jose
+            from jose import jwt as jose_jwt
+            payload = jose_jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            
         return payload
+        
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -325,6 +422,12 @@ def verify_jwt_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
+        )
+    except Exception as e:
+        print(f"JWT decoding error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
         )
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
@@ -362,207 +465,245 @@ def generate_reset_token() -> str:
     """Generates a 6-digit numeric OTP for password reset."""
     return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
 
-# Email Functions
-def send_verification_email(email: str, verification_code: str, first_name: str):
-    """Sends a verification email to the user."""
+# Medical System Helper Functions
+def encode_image_from_upload(upload_file: UploadFile) -> str:
     try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USERNAME
-        msg['To'] = email
-        msg['Subject'] = "Verify Your Account - Verification Code"
-        
-        html_body = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Verify Your Account</title>
-        </head>
-        <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-            <table role="presentation" style="width: 100%; border-collapse: collapse;">
-                <tr>
-                    <td style="padding: 40px 0; text-align: center;">
-                        <table role="presentation" style="width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-                            <tr>
-                                <td style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%); padding: 40px 30px; text-align: center; border-radius: 8px 8px 0 0;">
-                                    <h1 style="color: #ffffff; margin: 0; font-size: 28px; font-weight: bold;">Athlix</h1>
-                                    <p style="color: #ffffff; margin: 10px 0 0 0; font-size: 16px; opacity: 0.9;">Welcome! Please verify your account</p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 40px 30px;">
-                                    <div style="text-align: center; margin-bottom: 30px;">
-                                        <div style="width: 60px; height: 60px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%); border-radius: 50%; margin: 0 auto 15px auto; display: flex; align-items: center; justify-content: center;">
-                                            <span style="color: white; font-size: 24px;">✓</span>
-                                        </div>
-                                    </div>
-                                    
-                                    <h2 style="color: #333333; margin: 0 0 20px 0; font-size: 24px; text-align: center;">Hi {first_name}!</h2>
-                                    
-                                    <p style="color: #666666; font-size: 16px; line-height: 1.6; margin: 0 0 25px 0; text-align: center;">
-                                        🎉 Welcome to <strong>Athlix</strong>! We're excited to have you on board.
-                                    </p>
-                                    
-                                    <p style="color: #666666; font-size: 16px; line-height: 1.6; margin: 0 0 25px 0;">
-                                        To complete your account setup and ensure the security of your account, please verify your email address using the code below:
-                                    </p>
-                                    
-                                    <div style="background: linear-gradient(135deg, #e8f5e8 0%, #d4edda 100%); border: 2px solid #28a745; border-radius: 8px; padding: 25px; text-align: center; margin: 25px 0;">
-                                        <p style="margin: 0 0 10px 0; color: #333333; font-size: 14px; font-weight: bold;">Your Verification Code:</p>
-                                        <p style="margin: 0; font-size: 36px; font-weight: bold; color: #28a745; letter-spacing: 4px; font-family: 'Courier New', monospace;">{verification_code}</p>
-                                    </div>
-                                    
-                                    <div style="background-color: #fff8e1; border-left: 4px solid #ffc107; padding: 15px; border-radius: 4px; margin: 25px 0;">
-                                        <p style="color: #856404; font-size: 14px; margin: 0; font-weight: bold;">
-                                            ⏰ Quick Action Required: This code will expire in 15 minutes for security reasons.
-                                        </p>
-                                    </div>
-                                    
-                                    <p style="color: #666666; font-size: 16px; line-height: 1.6; margin: 25px 0 0 0;">
-                                        If you didn't create an account with Athlix, please ignore this email. No further action is required.
-                                    </p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td style="background-color: #f8f9fa; padding: 30px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e9ecef;">
-                                    <p style="margin: 0 0 10px 0; color: #333333; font-size: 16px; font-weight: bold;">Welcome to the team!</p>
-                                    <p style="margin: 0; color: #28a745; font-size: 18px; font-weight: bold;">The Athlix Team</p>
-                                    
-                                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e9ecef;">
-                                        <p style="margin: 0; color: #999999; font-size: 12px;">
-                                            This is an automated message. Please do not reply to this email.
-                                        </p>
-                                    </div>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </body>
-        </html>
-        """
-        
-        msg.attach(MIMEText(html_body, 'html'))
+        image_content = upload_file.file.read()
+        img = Image.open(io.BytesIO(image_content))
+        img.verify()
+        return base64.b64encode(image_content).decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file format.")
 
-        # Use STARTTLS on port 587
-        server = smtplib.SMTP("mail.privateemail.com", 587)
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        text = msg.as_string()
-        server.sendmail(SMTP_USERNAME, email, text)
-        server.quit()
-        print(f"Verification email sent to {email}")
+def get_initial_questions_from_image(base64_image: str) -> List[Dict]:
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a medical assessment AI. Analyze the provided image and generate important questions.\n                    Return a JSON object:\n                    {\n                        "questions": [\n                            {"id": "q1", "question": "Your question", "type": "text|multiple_choice|number", "options": ["option1", "option2"]}\n                        ]\n                    }\n                    Generate 3-5 relevant questions."""
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this image and provide questions."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }
+            ],
+            max_tokens=1000,
+            response_format={"type": "json_object"}
+        )
+        questions_data = json.loads(response.choices[0].message.content)
+        return questions_data.get("questions", [])
+    except Exception:
+        return [
+            {"id": str(uuid.uuid4()), "question": "Describe the primary issue or symptom.", "type": "text"},
+            {"id": str(uuid.uuid4()), "question": "When did you first notice this issue?", "type": "text"},
+            {"id": str(uuid.uuid4()), "question": "Rate any pain (1-10).", "type": "number"}
+        ]
 
+def generate_treatment_or_more_questions(session_data: Dict, db: Session) -> Dict:
+    try:
+        conversation_context = "User has uploaded an image.\n\nHere is the Q&A history:\n"
+        qa_history = db.query(MedicalQA).filter(MedicalQA.session_id == session_data["session_id"]).order_by(MedicalQA.created_at).all()
+        for qa in qa_history:
+            conversation_context += f"Q: {qa.question_text}\nA: {qa.answer}\n\n"
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a trainer and injury expert. Based on the history, decide if you can provide recommendations or need more questions.\n                    Return JSON:\n                    1. {\"need_more_info\": true, \"questions\": [{\"id\": \"q1\", \"question\": \"...\", \"type\": \"...\"}]}\n                    2. {\"need_more_info\": false, \"treatment\": \"...\"}"""
+                },
+                {"role": "user", "content": conversation_context}
+            ],
+            max_tokens=1500,
+            response_format={"type": "json_object"}
+        )
+        parsed_response = json.loads(response.choices[0].message.content)
+        if parsed_response["need_more_info"]:
+            for q in parsed_response["questions"]:
+                if "id" not in q or not q["id"]:
+                    q["id"] = str(uuid.uuid4())
+        return parsed_response
+    except Exception:
+        return {"need_more_info": false, "treatment": "Consult a professional."}
+
+# Email Functions
+
+def send_verification_email(email: str, verification_code: str, first_name: str):
+    """Send verification email using Mailjet API."""
+    
+    mailjet_api_key = os.getenv("MAILJET_API_KEY")
+    mailjet_secret_key = os.getenv("MAILJET_SECRET_KEY")
+    
+    url = "https://api.mailjet.com/v3.1/send"
+    
+    payload = {
+        "Messages": [
+            {
+                "From": {
+                    "Email": "noreply@athlix.fit",
+                    "Name": "Athlix"
+                },
+                "To": [
+                    {
+                        "Email": email,
+                        "Name": first_name
+                    }
+                ],
+                "Subject": "Athlix - Verify Your Account",
+                "TextPart": f"""
+Hi {first_name},
+
+Welcome to Athlix!
+
+Your verification code is: {verification_code}
+
+This code expires in 15 minutes.
+
+Best regards,
+The Athlix Team
+                """,
+                "HTMLPart": f"""
+<html>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+    <div style="background: #28a745; color: white; padding: 20px; text-align: center;">
+        <h1>Athlix</h1>
+        <p>Account Verification</p>
+    </div>
+    <div style="padding: 30px;">
+        <h2>Hi {first_name}!</h2>
+        <p>Welcome to Athlix! Please verify your email with this code:</p>
+        <div style="background: #f0f8f0; padding: 20px; text-align: center; margin: 20px 0; border-radius: 5px;">
+            <h1 style="color: #28a745; letter-spacing: 3px; margin: 0;">{verification_code}</h1>
+        </div>
+        <p><strong>This code expires in 15 minutes.</strong></p>
+        <p>If you didn't sign up, please ignore this email.</p>
+        <hr>
+        <p>Best regards,<br>The Athlix Team</p>
+    </div>
+</body>
+</html>
+                """
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            url,
+            auth=(mailjet_api_key, mailjet_secret_key),
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            print(f"✅ Verification email sent successfully to {email} via Mailjet")
+            result = response.json()
+            print(f"Message ID: {result['Messages'][0]['To'][0]['MessageID']}")
+        else:
+            print(f"❌ Failed to send email. Status: {response.status_code}")
+            print(f"Error: {response.text}")
+            
     except Exception as e:
-        print(f"Failed to send verification email to {email}: {str(e)}")
+        print(f"💥 Error sending email: {str(e)}")
+        raise
 
 def send_password_reset_email(email: str, reset_code: str, first_name: str):
-    """Sends a password reset email to the user with an embedded logo."""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USERNAME
-        msg['To'] = email
-        msg['Subject'] = "Password Reset Request"
+    """Sends a password reset email to the user with an embedded logo using SendGrid."""
+    mailjet_api_key = os.getenv("MAILJET_API_KEY")
+    mailjet_secret_key = os.getenv("MAILJET_SECRET_KEY")
+    
+    payload = {
+        "Messages": [
+            {
+                "From": {
+                    "Email": FROM_EMAIL,
+                    "Name": "Athlix Team"
+                },
+                "To": [
+                    {
+                        "Email": email,
+                        "Name": first_name
+                    }
+                ],
+                "Subject": "Athlix - Password Reset Code",
+                "TextPart": f"""
+Hi {first_name},
 
-        # HTML email body with CID reference for the logo
-        html_body = f"""
+We received a request to reset your password for your Athlix account.
+
+Your password reset code is: {reset_code}
+
+This code will expire in 30 minutes.
+
+If you didn't request a password reset, please ignore this email.
+
+Best regards,
+The Athlix Team
+                """,
+                "HTMLPart": f"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Password Reset Request</title>
+    <title>Password Reset</title>
 </head>
-<body style="margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; background-color: #f4f4f4;">
-    <table role="presentation" style="width: 100%; border-collapse: collapse;">
-        <tr>
-            <td style="padding: 40px 0; text-align: center;">
-                <table role="presentation" style="width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15);">
-                    <tr>
-                        <td style="padding: 50px 30px; text-align: center; border-radius: 12px 12px 0 0;">
-                            <img src="cid:athlix_logo" alt="Athlix Logo" style="max-width: 160px; height: auto; margin-bottom: 15px; border-radius: 8px;">
-                            <p style="color: #555555; margin: 12px 0 0 0; font-size: 18px; font-weight: 400;">Password Reset Request</p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 50px 40px;">
-                            <h2 style="color: #333333; margin: 0 0 25px 0; font-size: 26px; font-weight: 600;">Hi {first_name},</h2>
-                            
-                            <p style="color: #555555; font-size: 16px; line-height: 1.7; margin: 0 0 30px 0;">
-                                We received a request to reset your password for your Athlix account. Use the code below to reset your password:
-                            </p>
-                            
-                            <div style="background-color: #f8f9fa; border: 2px dashed #667eea; border-radius: 10px; padding: 25px; text-align: center; margin: 30px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-                                <p style="margin: 0 0 12px 0; color: #333333; font-size: 15px; font-weight: 600;">Your Reset Code:</p>
-                                <p id="resetCode" style="margin: 0 0 15px 0; font-size: 36px; font-weight: 700; color: #667eea; letter-spacing: 4px; font-family: 'Courier New', Courier, monospace;">{reset_code}</p>
-                                <button onclick="copyCode()" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff; border: none; padding: 12px 24px; font-size: 16px; font-weight: 600; border-radius: 8px; cursor: pointer; transition: opacity 0.3s;">Copy Code</button>
-                                <p style="color: #999999; font-size: 12px; margin: 10px 0 0 0;">(Clicking may not work in all email clients. Please copy the code manually if needed.)</p>
-                            </div>
-                            
-                            <p style="color: #555555; font-size: 16px; line-height: 1.7; margin: 30px 0;">
-                                <strong>Important:</strong> This code will expire in 30 minutes for security reasons.
-                            </p>
-                            
-                            <p style="color: #555555; font-size: 16px; line-height: 1.7; margin: 30px 0 0 0;">
-                                If you didn't request a password reset, please ignore this email. Your account remains secure.
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="background-color: #f8f9fa; padding: 40px; text-align: center; border-radius: 0 0 12px 12px; border-top: 1px solid #e9ecef;">
-                            <p style="margin: 0 0 12px 0; color: #333333; font-size: 18px; font-weight: 600;">Best regards,</p>
-                            <p style="margin: 0; color: #667eea; font-size: 20px; font-weight: 700;">The Athlix Team</p>
-                            
-                            <div style="margin-top: 25px; padding-top: 25px; border-top: 1px solid #e9ecef;">
-                                <p style="margin: 0; color: #999999; font-size: 13px;">
-                                    This is an automated message. Please do not reply to this email.
-                                </p>
-                            </div>
-                        </td>
-                    </tr>
-                </table>
-            </td>
-        </tr>
-    </table>
-    <script>
-        function copyCode() {{
-            let code = document.getElementById('resetCode').innerText;
-            navigator.clipboard.writeText(code).then(() => {{
-                alert('Code copied to clipboard!');
-            }}).catch(() => {{
-                alert('Failed to copy code. Please copy it manually.');
-            }});
-        }}
-    </script>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #667eea; margin: 0;">Athlix</h1>
+        <p style="color: #666; margin: 5px 0;">Password Reset Request</p>
+    </div>
+    
+    <h2 style="color: #333;">Hi {first_name}!</h2>
+    
+    <p>We received a request to reset your password for your Athlix account.</p>
+    
+    <div style="background: #f8f9fa; border: 2px solid #667eea; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
+        <p style="margin: 0 0 10px 0; color: #666; font-size: 14px;">Your Reset Code:</p>
+        <h1 style="margin: 0; color: #667eea; font-size: 32px; letter-spacing: 3px; font-family: monospace;">{reset_code}</h1>
+    </div>
+    
+    <p style="color: #e74c3c; font-weight: bold;">⏰ This code expires in 30 minutes.</p>
+    
+    <p>If you didn't request a password reset, please ignore this email. Your account remains secure.</p>
+    
+    <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+    
+    <p style="color: #666; font-size: 14px;">
+        Best regards,<br>
+        The Athlix Team
+    </p>
 </body>
 </html>
-        """
-
-        # Attach the HTML body
-        msg.attach(MIMEText(html_body, 'html'))
-
-        # Attach the logo image as a CID resource
-        with open("frontend/public/logo.png", "rb") as image_file:
-            logo = MIMEImage(image_file.read(), name="logo.png")
-            logo.add_header('Content-ID', '<athlix_logo>')
-            logo.add_header('Content-Disposition', 'inline', filename="logo.png")
-            msg.attach(logo)
-
-        # Send the email
-        server = smtplib.SMTP("mail.privateemail.com", 587)
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        text = msg.as_string()
-        server.sendmail(SMTP_USERNAME, email, text)
-        server.quit()
-        print(f"Verification email sent to {email}")
-
+                """
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.mailjet.com/v3.1/send",
+            auth=(mailjet_api_key, mailjet_secret_key),
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload),
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            message_id = result['Messages'][0]['To'][0]['MessageID']
+            print(f"✅ Password reset email sent to {email} via Mailjet")
+            print(f"📧 Message ID: {message_id}")
+        else:
+            print(f"❌ Mailjet error: {response.status_code} - {response.text}")
+            
     except Exception as e:
-        print(f"Failed to send password reset email to {email}: {str(e)}")
+        print(f"❌ Mailjet error: {str(e)}")
 
 def send_email_background(email: str, verification_code: str, first_name: str):
     """Helper to send verification email in a background thread."""
@@ -651,9 +792,12 @@ def analyze_image_and_generate_response(base64_image: str, user_message: str, us
         
         return response.choices[0].message.content
         
-    except Exception as e:
-        print(f"Error analyzing image with AI: {str(e)}")
-        return f"I'm sorry {user_data.first_name}, I'm having trouble analyzing the image right now. Could you describe your concern in text, and I'll do my best to help you based on our previous conversations."
+    except Exception:
+        return [
+            {"id": str(uuid.uuid4()), "question": "Describe the primary issue or symptom.", "type": "text"},
+            {"id": str(uuid.uuid4()), "question": "When did you first notice this issue?", "type": "text"},
+            {"id": str(uuid.uuid4()), "question": "Rate any pain (1-10).", "type": "number"}
+        ]
 
 
 def generate_chat_response(user_message: str, session_id: str, user_data: User, db: Session) -> str:
@@ -726,124 +870,34 @@ def generate_chat_response(user_message: str, session_id: str, user_data: User, 
         print(f"Error generating chat response from AI: {str(e)}")
         return f"I'm sorry {user_data.first_name}, I'm having trouble responding right now. Please try again later."
 
-
-@app.post("/chat/message")
-async def send_chat_message(
-    message: str = Form(...),
-    session_id: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Sends a chat message (text and/or image) to the AI and gets a response."""
-    
-    # Validate file if provided
-    if file and file.filename:
-        if not file.content_type or not file.content_type.startswith('image/'):
-            raise HTTPException(
-                status_code=400, 
-                detail="Uploaded file must be an image type (e.g., image/jpeg, image/png)."
-            )
-    
-    # Create or find chat session
-    chat_session = None
-    if session_id:
-        chat_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-        if chat_session and chat_session.user_id != current_user.id:
-            raise HTTPException(
-                status_code=403, 
-                detail="Access denied: This chat session does not belong to the current user."
-            )
-    
-    if not chat_session:
-        session_id = str(uuid.uuid4())
-        chat_session = ChatSession(
-            id=session_id,
-            user_id=current_user.id
-        )
-        db.add(chat_session)
-        db.flush()
-    
-    # Create user message record
-    user_message_record = ChatMessage(
-        session_id=chat_session.id,
-        user_id=current_user.id,
-        content=message,
-        is_user=True
-    )
-    db.add(user_message_record)
-    db.flush()  # Get the message ID
-    
-    # Handle image upload if provided
-    image_path = None
-    base64_image = None
-    if file and file.filename:
-        try:
-            image_path = save_uploaded_image(file, chat_session.id, user_message_record.id)
-            user_message_record.image_path = image_path
-            
-            # Convert image to base64 for AI analysis
-            with open(image_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode("utf-8")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-    
-    # Update session last activity
-    chat_session.last_activity = datetime.utcnow()
-    
-    # Generate AI response with conversation context
-    if base64_image:
-        # Use vision model for image analysis with conversation context
-        ai_response_text = analyze_image_and_generate_response(
-            base64_image, 
-            message, 
-            current_user,
-            chat_session.id,
-            db
-        )
-    else:
-        # Use regular chat model for text with full conversation history
-        ai_response_text = generate_chat_response(
-            message, 
-            chat_session.id, 
-            current_user,
-            db
-        )
-    
-    # Add AI's response to the session history
-    ai_message_record = ChatMessage(
-        session_id=chat_session.id,
-        user_id=current_user.id,
-        content=ai_response_text,
-        is_user=False
-    )
-    db.add(ai_message_record)
-    db.commit()
-    
-    return ChatResponseModel(
-        response=ai_response_text,
-        session_id=chat_session.id,
-        message_id=ai_message_record.id,
-        timestamp=ai_message_record.created_at
-    )
-
 def save_uploaded_image(file: UploadFile, session_id: str, message_id: str) -> str:
-    """
-    Saves an uploaded image file and returns the file path.
-    """
+    """Saves an uploaded image to the designated image directory."""
     try:
-        file_extension = file.filename.split('.')[-1].lower() if file.filename else 'jpg'
+        # Ensure the file pointer is at the beginning
+        file.file.seek(0)
+        
+        # Validate file extension
+        file_extension = file.filename.split('.')[-1].lower()
+        if file_extension not in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
+            raise HTTPException(status_code=400, detail=f"Invalid image file extension: {file_extension}")
+
+        # Create a unique filename to avoid collisions
         image_filename = f"{session_id}_{message_id}.{file_extension}"
         image_path = os.path.join(IMAGE_DIR, image_filename)
+
+        # Save the file
         with open(image_path, "wb") as f:
             f.write(file.file.read())
+
         return image_path
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving image: {str(e)}")
+        # Log the error for debugging
+        print(f"Error saving uploaded image: {str(e)}")
+        # Re-raise as an HTTPException to be handled by FastAPI
+        raise HTTPException(status_code=500, detail="Could not save uploaded image.")
 
 # --- API Endpoints ---
 
-# Authentication Endpoints
 @app.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def signup_user(user_data: UserSignup, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
@@ -862,7 +916,7 @@ async def signup_user(user_data: UserSignup, background_tasks: BackgroundTasks, 
     pending = db.query(PendingVerification).filter(PendingVerification.email == user_data.email.lower()).first()
     if pending:
         # If there's an expired pending verification, delete it to allow new signup
-        if datetime.utcnow() > pending.expires_at:
+        if datetime.now(timezone.utc) > pending.expires_at:
             db.delete(pending)
             db.commit()
         else:
@@ -892,14 +946,14 @@ async def signup_user(user_data: UserSignup, background_tasks: BackgroundTasks, 
         "last_name": user_data.last_name,
         "date_of_birth": user_data.date_of_birth.isoformat(),
         "password_hash": hashed_password,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     
     # Store pending verification in database
     pending_verification = PendingVerification(
         email=user_data.email.lower(),
         verification_code=verification_code,
-        expires_at=datetime.utcnow() + timedelta(minutes=15),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
         user_data=json.dumps(user_record_temp)
     )
     
@@ -941,7 +995,17 @@ async def verify_email(verification_data: EmailVerification, db: Session = Depen
             detail="No pending verification found for this email."
         )
     
-    if datetime.utcnow() > pending.expires_at:
+    # Fix: Make both datetimes timezone-aware for comparison
+    current_time = datetime.now(timezone.utc)
+    
+    # Convert pending.expires_at to timezone-aware if it's naive
+    if pending.expires_at.tzinfo is None:
+        # Assume it's UTC if no timezone info
+        expires_at_utc = pending.expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at_utc = pending.expires_at
+    
+    if current_time > expires_at_utc:
         db.delete(pending)
         db.commit()
         raise HTTPException(
@@ -967,13 +1031,13 @@ async def verify_email(verification_data: EmailVerification, db: Session = Depen
         date_of_birth=date.fromisoformat(user_data["date_of_birth"]),
         password_hash=user_data["password_hash"],
         is_verified=True,
-        created_at=datetime.fromisoformat(user_data["created_at"]),
-        verified_at=datetime.utcnow()
+        created_at=datetime.fromisoformat(user_data["created_at"]).replace(tzinfo=timezone.utc),
+        verified_at=datetime.now(timezone.utc)
     )
     
-    db.add(new_user)
-    db.delete(pending)
-    db.commit()
+    db.add(new_user);
+    db.delete(pending);
+    db.commit();
     
     return {
         "message": "Email verified successfully! Your account has been created and is now active.",
@@ -998,7 +1062,7 @@ async def resend_verification(email: EmailStr, background_tasks: BackgroundTasks
     
     # Update existing pending verification with new code and expiration
     pending.verification_code = new_verification_code
-    pending.expires_at = datetime.utcnow() + timedelta(minutes=15)
+    pending.expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
     
     db.commit()
     
@@ -1011,7 +1075,8 @@ async def resend_verification(email: EmailStr, background_tasks: BackgroundTasks
         user_data["first_name"]
     )
     
-    return {"message": "Verification code resent successfully. Please check your email."}
+    return {"message": "Verification code resent successfully. Please check your email."
+}
 
 @app.post("/auth/signin", response_model=SignInResponse)
 async def signin_user(signin_data: UserSignIn, db: Session = Depends(get_db)):
@@ -1079,7 +1144,7 @@ async def forgot_password(forgot_data: ForgotPassword, background_tasks: Backgro
     reset_token = PasswordResetToken(
         email=email,
         reset_code=reset_code,
-        expires_at=datetime.utcnow() + timedelta(minutes=30)
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30)
     )
     
     db.add(reset_token)
@@ -1094,6 +1159,7 @@ async def forgot_password(forgot_data: ForgotPassword, background_tasks: Backgro
     
     return {"message": "If the email exists in our system, a password reset code has been sent."}
 
+# Also fix the reset_password function:
 @app.post("/reset-password", status_code=status.HTTP_200_OK)
 async def reset_password(reset_data: ResetPassword, db: Session = Depends(get_db)):
     """Resets the user's password using the provided reset code."""
@@ -1106,7 +1172,6 @@ async def reset_password(reset_data: ResetPassword, db: Session = Depends(get_db
             detail="Invalid email or reset code."
         )
     
-    
     reset_token_record = db.query(PasswordResetToken).filter(
         PasswordResetToken.email == email,
         PasswordResetToken.reset_code == reset_data.reset_code
@@ -1118,7 +1183,16 @@ async def reset_password(reset_data: ResetPassword, db: Session = Depends(get_db
             detail="Invalid email or reset code."
         )
     
-    if datetime.utcnow() > reset_token_record.expires_at:
+    # Fix: Handle timezone comparison
+    current_time = datetime.now(timezone.utc)
+    
+    # Convert expires_at to timezone-aware if it's naive
+    if reset_token_record.expires_at.tzinfo is None:
+        expires_at_utc = reset_token_record.expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at_utc = reset_token_record.expires_at
+    
+    if current_time > expires_at_utc:
         db.delete(reset_token_record)
         db.commit()
         raise HTTPException(
@@ -1128,7 +1202,7 @@ async def reset_password(reset_data: ResetPassword, db: Session = Depends(get_db
     
     # Update user's password and password_updated_at timestamp
     user.password_hash = hash_password(reset_data.new_password)
-    user.password_updated_at = datetime.utcnow()
+    user.password_updated_at = datetime.now(timezone.utc)
     
     db.delete(reset_token_record)
     db.commit()
@@ -1152,6 +1226,171 @@ async def get_profile(current_user: User = Depends(get_current_user)):
         is_verified=current_user.is_verified,
         message="User profile retrieved successfully."
     )
+
+@app.post("/upload-image/")
+async def upload_image(current_user: User = Depends(get_current_user), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+    session_id = str(uuid.uuid4())
+    file_extension = file.filename.split('.')[-1].lower()
+    image_filename = f"{session_id}.{file_extension}"
+    image_path = os.path.join(IMAGE_DIR, image_filename)
+    with open(image_path, "wb") as f:
+        f.write(await file.read())
+    medical_session = MedicalSession(
+        id=session_id,
+        user_id=current_user.id,
+        image_path=image_path,
+        status="questioning",
+        current_question_index=0
+    )
+    db.add(medical_session)
+    with open(image_path, "rb") as image_file:
+        base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+    questions = get_initial_questions_from_image(base64_image)
+    for i, q_data in enumerate(questions):
+        q_id = q_data.get("id", str(uuid.uuid4()))
+        medical_question = MedicalQuestion(
+            id=q_id,
+            session_id=session_id,
+            question_text=q_data["question"],
+            question_type=q_data.get("type", "text"),
+            options=json.dumps(q_data.get("options", [])) if q_data.get("options") else None,
+            order_index=i
+        )
+        db.add(medical_question)
+    db.commit()
+    current_question = {
+        "id": questions[0]["id"],
+        "question": questions[0]["question"],
+        "type": questions[0].get("type", "text"),
+        "options": questions[0].get("options", [])
+    } if questions else None
+    return {
+        "session_id": session_id,
+        "status": "questioning",
+        "questions": questions,
+        "current_question": current_question,
+        "image_url": f"/images/{image_filename}"
+    }
+
+@app.post("/answer-question/")
+async def answer_question(response: QuestionResponse, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = db.query(MedicalSession).filter(MedicalSession.id == response.session_id).first()
+    if not session or session.user_id != current_user.id or session.status != "questioning":
+        raise HTTPException(status_code=400, detail="Invalid session.")
+    question_answered = db.query(MedicalQuestion).filter(
+        MedicalQuestion.session_id == response.session_id,
+        MedicalQuestion.id == response.question_id
+    ).first()
+    if not question_answered:
+        raise HTTPException(status_code=400, detail="Question not found.")
+    all_questions = db.query(MedicalQuestion).filter(MedicalQuestion.session_id == response.session_id).order_by(MedicalQuestion.order_index).all()
+    for idx, q in enumerate(all_questions):
+        if q.id == question_answered.id:
+            session.current_question_index = idx + 1
+            break
+    qa_record = MedicalQA(
+        session_id=response.session_id,
+        question_id=response.question_id,
+        question_text=question_answered.question_text,
+        answer=response.answer
+    )
+    db.add(qa_record)
+    if session.current_question_index < len(all_questions):
+        next_question_db = all_questions[session.current_question_index]
+        next_question = {
+            "id": next_question_db.id,
+            "question": next_question_db.question_text,
+            "type": next_question_db.question_type,
+            "options": json.loads(next_question_db.options) if next_question_db.options else []
+        }
+        db.commit()
+        return {
+            "session_id": response.session_id,
+            "status": "questioning",
+            "current_question": next_question,
+            "questions_remaining": len(all_questions) - session.current_question_index
+        }
+    else:
+        ai_decision = generate_treatment_or_more_questions({"session_id": response.session_id}, db)
+        if ai_decision.get("need_more_info", False):
+            new_questions = ai_decision.get("questions", [])
+            for i, new_q_data in enumerate(new_questions):
+                new_q_id = new_q_data.get("id", str(uuid.uuid4()))
+                medical_question = MedicalQuestion(
+                    id=new_q_id,
+                    session_id=response.session_id,
+                    question_text=new_q_data["question"],
+                    question_type=new_q_data.get("type", "text"),
+                    options=json.dumps(new_q_data.get("options", [])) if new_q_data.get("options") else None,
+                    order_index=len(all_questions) + i
+                )
+                db.add(medical_question)
+            session.current_question_index = len(all_questions)
+            db.commit()
+            next_question = {
+                "id": new_questions[0]["id"],
+                "question": new_questions[0]["question"],
+                "type": new_questions[0].get("type", "text"),
+                "options": new_questions[0].get("options", [])
+            } if new_questions else None
+            return {
+                "session_id": response.session_id,
+                "status": "questioning",
+                "current_question": next_question,
+                "questions_remaining": len(new_questions)
+            }
+        else:
+            treatment_text = ai_decision.get("treatment", "Consult a professional.")
+            session.treatment = treatment_text
+            session.status = "completed"
+            db.commit()
+            return TreatmentResponse(
+                session_id=response.session_id,
+                treatment=treatment_text,
+                session_complete=True
+            )
+
+@app.get("/medical-session/{session_id}", response_model=SessionStatus)
+async def get_medical_session_status(session_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session = db.query(MedicalSession).filter(MedicalSession.id == session_id).first()
+    if not session or session.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Session not found or access denied.")
+    questions = db.query(MedicalQuestion).filter(MedicalQuestion.session_id == session_id).order_by(MedicalQuestion.order_index).all()
+    questions_list = [
+        {
+            "id": q.id,
+            "question": q.question_text,
+            "type": q.question_type,
+            "options": json.loads(q.options) if q.options else []
+        }
+        for q in questions
+    ]
+    return SessionStatus(
+        session_id=session_id,
+        status=session.status,
+        questions=questions_list,
+        current_question_index=session.current_question_index,
+        treatment=session.treatment
+    )
+
+@app.get("/my-medical-sessions")
+async def get_user_medical_sessions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sessions = db.query(MedicalSession).filter(MedicalSession.user_id == current_user.id).order_by(MedicalSession.created_at.desc()).all()
+    user_sessions = [
+        {
+            "session_id": session.id,
+            "status": session.status,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "questions_count": db.query(MedicalQuestion).filter(MedicalQuestion.session_id == session.id).count(),
+            "answers_count": db.query(MedicalQA).filter(MedicalQA.session_id == session.id).count(),
+            "has_treatment": session.treatment is not None
+        }
+        for session in sessions
+    ]
+    return {"sessions": user_sessions, "total_sessions": len(user_sessions)}
 
 # Chat System Endpoints
 @app.post("/chat/new")
@@ -1239,7 +1478,7 @@ async def send_chat_message(
             raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
     
     # Update session last activity
-    chat_session.last_activity = datetime.utcnow()
+    chat_session.last_activity = datetime.now(timezone.utc)
     
     # Generate AI response with conversation context
     if base64_image:
@@ -1584,120 +1823,261 @@ async def get_system_stats(db: Session = Depends(get_db)):
         "outstanding_password_reset_tokens": password_reset_tokens
     }
 
-@app.get("/")
-async def root():
-    """Root endpoint providing API information and setup instructions."""
-    return {
-        "message": "Complete Medical & Authentication API with Integrated Chat System",
-        "version": "3.0.0",
-        "database": "SQLAlchemy with SQLite (default) / PostgreSQL",
-        "features": [
-            "Secure User Authentication (Signup, Signin, Email Verification, Password Reset)",
-            "JWT-based Authorization for protected endpoints",
-            "Integrated Chat System with AI Assistant",
-            "Medical Image Analysis with AI (OpenAI Vision)",
-            "Text and Image Support in Chat Messages",
-            "AI-powered Medical Consultation and Health Advice",
-            "Session Management for Chat Conversations",
-            "Image Upload and Storage with Chat Messages",
-            "Robust Database Storage for all user and chat data",
-            "Comprehensive Dashboard for user activity overview"
-        ],
-        "endpoints_summary": {
-            "Authentication & User": {
-                "/signup (POST)": "Create new user account (requires email verification)",
-                "/verify-email (POST)": "Verify email with code to activate account",
-                "/resend-verification (POST)": "Resend email verification code",
-                "/auth/signin (POST)": "Sign in and get JWT access token",
-                "/forgot-password (POST)": "Request password reset code via email",
-                "/reset-password (POST)": "Reset password using code",
-                "/profile (GET)": "Get current user's profile (protected)",
-                "/users/{email} (GET)": "Get user details by email (protected, self-only)",
-                "/dashboard (GET)": "User's activity dashboard (protected)"
-            },
-            "Chat System with Medical AI": {
-                "/chat/new (POST)": "Create a new chat session (protected)",
-                "/chat/message (POST)": "Send message (text and/or image) to AI chat assistant (protected)",
-                "/chat/sessions (GET)": "List all chat sessions for the user (protected)",
-                "/chat/session/{session_id} (GET)": "Get a specific chat session with messages (protected)",
-                "/chat/session/{session_id} (DELETE)": "Delete a specific chat session (protected)",
-                "/chat/sessions/all (DELETE)": "Delete all chat sessions for the user (protected)",
-                "/chat/history (GET)": "Get overall chat message history (protected)"
-            },
-            "Admin/Testing Endpoints": {
-                "/pending-verifications (GET)": "View all pending email verifications",
-                "/verified-users (GET)": "View count of verified users",
-                "/system-stats (GET)": "Get overall system statistics"
-            },
-            "Static Files & Documentation": {
-                "/images/{filename} (GET)": "Access uploaded images",
-                "/docs (GET)": "OpenAPI interactive documentation (Swagger UI)"
-            }
-        },
-        "chat_system_details": {
-            "message_types": [
-                "Text only messages",
-                "Image only messages",
-                "Combined text and image messages"
-            ],
-            "ai_capabilities": [
-                "Medical image analysis and consultation",
-                "Health and wellness advice",
-                "Fitness and workout guidance",
-                "Injury prevention tips",
-                "General medical information",
-                "Conversational support and follow-up questions"
-            ],
-            "image_support": {
-                "formats": "JPEG, PNG, and other common image formats",
-                "storage": "Images stored locally with database references",
-                "access": "Images accessible via /images/{filename} endpoint",
-                "ai_analysis": "OpenAI Vision API for medical image analysis"
-            }
-        },
-        "authentication_details": {
-            "type": "Bearer Token (JWT)",
-            "header": "Authorization: Bearer <your-jwt-token>",
-            "token_expiration": f"{JWT_EXPIRATION_HOURS} hours"
-        },
-        "setup_instructions": {
-            "1": "Install dependencies: `pip install fastapi 'uvicorn[standard]' sqlalchemy python-dotenv 'openai>=1.0.0' 'Pillow' 'email-validator' python-multipart`",
-            "2": [
-                "Create a `.env` file in the project root with the following variables:",
-                "`DATABASE_URL=\"sqlite:///./medical_app.db\"` (or your PostgreSQL URL)",
-                "`EMAIL_ADDRESS=\"your_email@gmail.com\"` (Your Gmail address for sending emails)",
-                "`EMAIL_PASSWORD=\"your_gmail_app_password\"` (Generate this from Google Account security settings)",
-                "`OPENAI_API_KEY=\"your_openai_api_key_here\"` (Your API key for OpenAI services)",
-                "`JWT_SECRET_KEY=\"a_very_strong_random_secret_key_for_production\"` (Generate with `secrets.token_urlsafe(32)`)"
-            ],
-            "3": "Run the application: `uvicorn main:app --reload` (replace 'main' with your file name)",
-            "4": "Access API documentation at: `http://127.0.0.1:8000/docs`",
-            "5": "Upload images and chat with the AI at the various chat endpoints"
-        },
-        "database_models_overview": {
-            "users": "User accounts with authentication details",
-            "pending_verifications": "Temporary records for email verification codes",
-            "password_reset_tokens": "Temporary records for password reset codes",
-            "chat_sessions": "Records for each AI chat conversation",
-            "chat_messages": "Individual messages within chat sessions (user and AI) with optional image paths"
-        },
-        "api_usage_examples": {
-            "create_chat": "POST /chat/new",
-            "send_text_message": "POST /chat/message with form data: message='Hello, I have a question about my health'",
-            "send_image_message": "POST /chat/message with form data: message='Please analyze this image' and file upload",
-            "send_combined_message": "POST /chat/message with both message text and image file",
-            "get_chat_history": "GET /chat/session/{session_id}"
-        },
-        "notes": [
-            "All chat messages support both text and image content",
-            "Images are automatically analyzed by AI when uploaded",
-            "Chat sessions persist user conversation history",
-            "AI provides medical consultation but recommends professional healthcare for serious concerns",
-            "Remember to keep your API keys and secrets secure",
-            "For production, consider more robust email services and PostgreSQL database"
-        ]
-    }
+@app.get("/download_messages")
+async def download_messages(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # In a real application, you'd likely want to restrict this to an admin role.
+    if not current_user.is_verified:
+        raise HTTPException(status_code=403, detail="User not verified")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Fetch all users and their messages
+    users = db.query(User).options(joinedload(User.chat_messages)).all()
+
+    # Create a string buffer to hold CSV data
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Write CSV header
+    writer.writerow(["user_id", "user_email", "message_id", "message_content", "message_timestamp"])
+
+    # Write message data
+    for user in users:
+        for message in user.chat_messages:
+            writer.writerow([user.id, user.email, message.id, message.content, message.created_at.isoformat()])
+
+    # Seek to the beginning of the buffer
+    output.seek(0)
+
+    # Return as a streaming response
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=messages.csv"})
+
+@app.get("/download_all_messages_detailed")
+async def download_all_messages_detailed(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    format: str = "csv",  # csv, json, excel
+    include_images: bool = True,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None
+):
+    """
+    Download all chat messages with detailed user information in various formats
+    
+    Parameters:
+    - format: Output format (csv, json, excel)
+    - include_images: Whether to include image information
+    - date_from: Filter messages from this date (YYYY-MM-DD)
+    - date_to: Filter messages to this date (YYYY-MM-DD)
+    """
+    
+    # Check if user is verified (add admin check if needed)
+    if not current_user.is_verified:
+        raise HTTPException(status_code=403, detail="User not verified")
+    
+    # Build base query with comprehensive joins
+    query = db.query(
+        # User information
+        User.id.label('user_id'),
+        User.email.label('user_email'),
+        User.first_name.label('user_first_name'),
+        User.middle_name.label('user_middle_name'),
+        User.last_name.label('user_last_name'),
+        User.date_of_birth.label('user_date_of_birth'),
+        User.created_at.label('user_account_created'),
+        User.verified_at.label('user_verified_at'),
+        
+        # Session information
+        ChatSession.id.label('session_id'),
+        ChatSession.created_at.label('session_created_at'),
+        ChatSession.last_activity.label('session_last_activity'),
+        
+        # Message information
+        ChatMessage.id.label('message_id'),
+        ChatMessage.content.label('message_content'),
+        ChatMessage.is_user.label('is_user_message'),
+        ChatMessage.image_path.label('message_image_path'),
+        ChatMessage.created_at.label('message_timestamp')
+    ).join(
+        ChatSession, User.id == ChatSession.user_id
+    ).join(
+        ChatMessage, ChatSession.id == ChatMessage.session_id
+    )
+    
+    # Apply date filters if provided
+    if date_from:
+        try:
+            date_from_obj = datetime.strptime(date_from, "%Y-%m-%d")
+            query = query.filter(ChatMessage.created_at >= date_from_obj)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date_from format. Use YYYY-MM-DD")
+    
+    if date_to:
+        try:
+            date_to_obj = datetime.strptime(date_to, "%Y-%m-%d")
+            # Add 1 day to include the entire date_to day
+            date_to_obj = date_to_obj.replace(hour=23, minute=59, second=59)
+            query = query.filter(ChatMessage.created_at <= date_to_obj)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date_to format. Use YYYY-MM-DD")
+    
+    # Order by user, session, then message timestamp
+    query = query.order_by(
+        User.email,
+        ChatSession.created_at,
+        ChatMessage.created_at
+    )
+    
+    # Execute query
+    results = query.all()
+    
+    if not results:
+        raise HTTPException(status_code=404, detail="No messages found")
+    
+    # Process results into structured data
+    processed_data = []
+    for row in results:
+        # Calculate user's full name
+        full_name_parts = [row.user_first_name]
+        if row.user_middle_name:
+            full_name_parts.append(row.user_middle_name)
+        full_name_parts.append(row.user_last_name)
+        full_name = " ".join(full_name_parts)
+        
+        # Process image information
+        image_filename = None
+        image_url = None
+        has_image = bool(row.message_image_path)
+        
+        if include_images and row.message_image_path:
+            image_filename = os.path.basename(row.message_image_path)
+            image_url = f"/images/{image_filename}"
+        
+        # Calculate message length and word count
+        message_length = len(row.message_content) if row.message_content else 0
+        word_count = len(row.message_content.split()) if row.message_content else 0
+        
+        # Determine sender type
+        sender_type = "User" if row.is_user_message else "AI Assistant"
+        
+        # Calculate user's account age at time of message
+        account_age_days = None
+        if row.user_account_created and row.message_timestamp:
+            account_age = row.message_timestamp - row.user_account_created
+            account_age_days = account_age.days
+        
+        record = {
+            # User Information
+            'user_id': row.user_id,
+            'user_email': row.user_email,
+            'user_full_name': full_name,
+            'user_first_name': row.user_first_name,
+            'user_middle_name': row.user_middle_name or '',
+            'user_last_name': row.user_last_name,
+            'user_date_of_birth': row.user_date_of_birth.isoformat() if row.user_date_of_birth else '',
+            'user_account_created': row.user_account_created.isoformat() if row.user_account_created else '',
+            'user_verified_at': row.user_verified_at.isoformat() if row.user_verified_at else '',
+            'user_account_age_days': account_age_days,
+            
+            # Session Information
+            'session_id': row.session_id,
+            'session_created_at': row.session_created_at.isoformat() if row.session_created_at else '',
+            'session_last_activity': row.session_last_activity.isoformat() if row.session_last_activity else '',
+            
+            # Message Information
+            'message_id': row.message_id,
+            'message_content': row.message_content or '',
+            'message_content_preview': (row.message_content[:100] + '...') if row.message_content and len(row.message_content) > 100 else (row.message_content or ''),
+            'message_length': message_length,
+            'message_word_count': word_count,
+            'sender_type': sender_type,
+            'is_user_message': row.is_user_message,
+            'message_timestamp': row.message_timestamp.isoformat() if row.message_timestamp else '',
+            'message_date': row.message_timestamp.date().isoformat() if row.message_timestamp else '',
+            'message_time': row.message_timestamp.time().isoformat() if row.message_timestamp else '',
+            
+            # Image Information
+            'has_image': has_image,
+            'image_filename': image_filename or '',
+            'image_url': image_url or ''
+        }
+        
+        processed_data.append(record)
+    
+    # Generate filename with timestamp and filters
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    date_filter_str = ""
+    if date_from or date_to:
+        date_filter_str = f"_{date_from or 'start'}_to_{date_to or 'end'}"
+    
+    # Return data in requested format
+    if format.lower() == "json":
+        return {
+            "metadata": {
+                "total_messages": len(processed_data),
+                "export_timestamp": datetime.now().isoformat(),
+                "date_filter": {
+                    "from": date_from,
+                    "to": date_to
+                },
+                "include_images": include_images
+            },
+            "messages": processed_data
+        }
+    
+    # Convert to DataFrame for CSV and Excel export
+    df = pd.DataFrame(processed_data)
+    
+    if format.lower() == "excel":
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Messages')
+        
+        filename = f"chat_history{date_filter_str}_{timestamp}.xlsx"
+        headers = {
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+        return StreamingResponse(io.BytesIO(output.getvalue()), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+    # Default to CSV
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+    
+    filename = f"chat_history{date_filter_str}_{timestamp}.csv"
+    headers = {
+        "Content-Disposition": f"attachment; filename={filename}"
+    }
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+# Static files (for serving frontend)
+@app.get("/{full_path:path}")
+async def serve_static_files(full_path: str, request: Request):
+    # This is a simple catch-all. In a real-world scenario, you'd want a more robust
+    # static file serving solution, likely handled by a web server like Nginx.
+    
+    # Path to the 'out' directory from the root of your project
+    static_dir = os.path.join(os.getcwd(), "frontend", "out")
+    
+    # Prevent directory traversal attacks
+    if ".." in full_path:
+        raise HTTPException(status_code=404, detail="Not Found")
+        
+    file_path = os.path.join(static_dir, full_path)
+    
+    # Default to index.html for root requests
+    if full_path == "" or full_path.endswith("/"):
+        file_path = os.path.join(static_dir, "index.html")
+        
+    # If the requested file doesn't exist, try to serve the corresponding .html file
+    if not os.path.exists(file_path):
+        html_file_path = os.path.join(static_dir, f"{full_path}.html")
+        if os.path.exists(html_file_path):
+            file_path = html_file_path
+        else:
+            # Fallback to index.html for SPA routing
+            index_path = os.path.join(static_dir, "index.html")
+            if os.path.exists(index_path):
+                return FileResponse(index_path)
+            else:
+                raise HTTPException(status_code=404, detail="Not Found")
+
+    return FileResponse(file_path)

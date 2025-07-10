@@ -59,7 +59,7 @@ export default function SignIn() {
     setErrors({})
 
     try {
-      const response = await fetch('http://localhost:8000/auth/signin', {
+      const response = await fetch('/auth/signin', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -77,14 +77,7 @@ export default function SignIn() {
         localStorage.setItem('user', JSON.stringify(data.user))
         
         // Log success for debugging
-        console.log('Authentication successful:', {
-          token_type: data.token_type,
-          expires_in: data.expires_in,
-          user: data.user
-        })
         
-        // Show success message
-        console.log(`Welcome back, ${data.user.first_name}!`)
         
         // Redirect to chat page
         router.push('/chat')
@@ -133,7 +126,7 @@ export default function SignIn() {
         {/* Header */}
         <div className="text-center mb-8">
           <div className="mx-auto flex items-center justify-center mb-4">
-            <image src="/logo.png" alt="Logo" />
+            <img src="/logo.png" alt="Logo" width="100" height="100" />
           </div>
           <h2 className="text-3xl font-bold text-gray-900 mb-2">Welcome back</h2>
           <p className="text-gray-600">

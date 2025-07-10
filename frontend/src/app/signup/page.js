@@ -4,6 +4,7 @@ import { useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 
+
 export default function SignUp() {
   const [formData, setFormData] = useState({
     email: '',
@@ -110,7 +111,7 @@ export default function SignUp() {
     setErrors({})
 
     try {
-      const response = await fetch('http://localhost:8000/signup', {
+      const response = await fetch('/signup', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -172,7 +173,7 @@ export default function SignUp() {
               Account Creation Initiated! 🎉
             </h2>
             <p className="text-gray-600 mb-8">
-              We've sent a verification code to your email address. You'll be redirected to the verification page shortly.
+              We&apos;ve sent a verification code to your email address. You&apos;ll be redirected to the verification page shortly.
             </p>
             <div className="flex items-center justify-center">
               <svg className="animate-spin h-5 w-5 text-indigo-600 mr-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -191,7 +192,9 @@ export default function SignUp() {
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-cyan-50 flex items-center justify-center p-4 sm:p-6 lg:p-6">
       <div className="w-full max-w-md border border-black/20 rounded-2xl shadow-lg p-4">
         <div className="text-center mb-8">
-          <img src="/logo.png" alt="Logo" />
+          <div className="mx-auto flex items-center justify-center mb-4">
+            <img src="/logo.png" alt="Logo" width="100" height="100" />
+          </div>
           <h2 className="text-3xl font-bold text-gray-900 mb-2">Create Account</h2>
           <p className="text-gray-600">
             Sign up to get started with our medical platform
